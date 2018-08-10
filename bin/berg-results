@@ -1,0 +1,80 @@
+#! bin/python
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+import os
+import time
+
+import click
+
+from berg import logger
+from berg.configuration import config
+from berg.util import check_call
+
+
+@click.group()
+@click.option('--verbose/--quiet', '-v/-q', is_flag=True, default=True)
+def cli(verbose):
+  if verbose:
+    logger.setLevel(logging.DEBUG)
+
+
+def _sync():
+  check_call('gsutil -m rsync -r -x ".*.ckpt" %s %s' % (
+    config.gcs_results_root, config.instance_results_root
+  ))
+
+
+@cli.command()
+@click.argument('-c', '--continuous', default=False)
+def sync(continuous):
+  """Regularly sync results from our bucket down locally"""
+  _sync()
+  if continuous:
+    while True:
+      _sync()
+      time.sleep(10)
+
+
+@cli.command()
+@click.argument('rel-path')
+@click.option('-r', '--recursive', is_flag=True, default=False)
+@click.option('-d', '--dest-root', default=None)
+def fetch(rel_path, recursive, dest_root):
+  rel_path = rel_path.split('/berg_results/')[-1]
+  gcs_src_path = os.path.join(config.gcs_results_root, rel_path)
+
+  if not dest_root:
+    dest_root = config.instance_results_root
+
+  dest_path = os.path.join(dest_root, rel_path)
+
+  if recursive:
+    os.makedirs(dest_path, exist_ok=True)
+
+    check_call('gsutil -m rsync -r -x ".*.ckpt" %s %s' % (
+      gcs_src_path, dest_path
+    ))
+  else:
+    dest_dir = os.path.dirname(dest_path)
+    os.makedirs(dest_dir, exist_ok=True)
+
+    check_call('gsutil cp %s %s' % (
+      gcs_src_path, dest_dir
+    ))
+  print("Copied to %s" % dest_path)
+
+
+if __name__ == '__main__':
+  cli()

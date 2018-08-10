@@ -1,0 +1,140 @@
+#! bin/python
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import atexit
+import logging
+import os
+import subprocess
+import time
+import socket
+
+import berg
+import click
+from berg import logger, git_util
+from berg import metadata_util, gsutil, util
+from berg.configuration import config
+from berg.util import check_output, check_call
+
+
+def _upload_results():
+  # TODO: If slow, only upload a certain directory to speed things up
+  gsutil.rsync(config.instance_results_root, config.gcs_results_root)
+
+
+def _continuously_upload_results_in_background():
+  os.makedirs(config.instance_results_root, exist_ok=True)
+  upload_proc = subprocess.Popen("exec berg-worker continuously-upload-results",
+                                 shell=True)
+  atexit.register(lambda: upload_proc.kill())
+
+
+@click.group()
+@click.option('--verbose/--quiet', '-v/-q', is_flag=True, default=True)
+def cli(verbose):
+  if verbose:
+    logger.setLevel(logging.DEBUG)
+  logger.debug("Running berg version: %s" % berg.VERSION)
+
+
+@cli.command()
+@click.option('--bucket', '-b')
+def init(bucket):
+  """Initialize berg-worker with a bucket and self-update the code"""
+  config.initialize_with_bucket(bucket)
+  gsutil.download_repo('berg')
+  check_output('pip install --upgrade -e /root/code/berg')
+
+
+@cli.command()
+@click.argument('job_name')
+@click.option('--force-no-kill', is_flag=True, default=False)
+def run(job_name, force_no_kill):
+  """Download and execute a job, upload results"""
+  metadata = metadata_util.fetch_and_parse(job_name)
+  repo_name = metadata['repo_name']
+
+  # Check out the same git state that the user had when they started the job
+  gsutil.download_repo(repo_name)
+  git_setup = f"git reset --hard {metadata['git_commit']} && git clean -xfd"
+  if metadata['git_patch']:
+    patch_path = git_util.write_temp_patchfile(metadata['git_patch'], job_name)
+    git_setup += " && git apply %s" % patch_path
+
+  if metadata['use_mpi']:
+    # write MPI hostfile
+    with open('/root/hostfile', "w+") as f:
+      for h in metadata['host_names']:
+        f.write(h+' slots='+str(metadata['mpi_proc_per_machine'])+'\n')
+
+    # setup SSH
+    master_hostname = metadata['host_names'][0]
+    gskey = os.path.join(config.gcs_berg_root, 'keys', master_hostname, 'berg_mpi_key.pub')
+    if socket.gethostname() == master_hostname:
+      # make an ssh key, upload public key
+      check_call('rm /root/.ssh/berg_mpi_key*', permissive=True)
+      check_call('ssh-keygen -t rsa -N "" -f /root/.ssh/berg_mpi_key')
+      check_call('gsutil cp /root/.ssh/berg_mpi_key.pub %s' % gskey)
+      with open('/root/.ssh/config', "w+") as f:
+        for h in metadata['host_names'][1:]:
+          f.write('Host %s\n  IdentityFile /root/.ssh/berg_mpi_key\n  StrictHostKeyChecking no\n' % h)
+      time.sleep(10) # give workers some time to install the key
+      success = {h: False for h in metadata['host_names'][1:]}
+      while not all(success.values()):
+        for h in metadata['host_names'][1:]:
+          if not success[h]:
+            success[h] = check_call('ssh ' + h, permissive=True)
+            if not success[h]:
+              print("\nMPI master is waiting for host %s" % h)
+              time.sleep(10) # don't make too many requests
+      print("\nMPI master setup is done")
+    else:
+      # download master public key, add to authorized_keys
+      while not check_call('gsutil cp %s /root/.ssh/berg_mpi_key.pub' % gskey, permissive=True):
+        print("\nMPI worker %s is waiting to download master public key" % socket.gethostname())
+        time.sleep(1)
+      check_call("cat /root/.ssh/berg_mpi_key.pub >> /root/.ssh/authorized_keys")
+      print("\nMPI worker %s authorized the master public key" % socket.gethostname())
+
+  print("\n======== Executing command payload ========")
+  payload = f"""
+  cd /root/code/{repo_name} && \\
+    {git_setup} && \\
+    {metadata['install_script']} && \\
+    {metadata['cmd']}
+    """
+  print(payload)
+  _continuously_upload_results_in_background()
+  subprocess.run(payload, shell=True)
+
+  print("Uploading final results...")
+  _upload_results()
+
+  if not metadata.get('kill_instance_after_job') or force_no_kill:
+    print("Received --no-kill flag. Keeping instance alive")
+  else:  # Kill this instance
+    print(f"Cleaning up and terminating instance: {job_name}")
+    util.check_call(
+      f"gcloud -q compute instances delete --zone us-west1-b {job_name}")
+
+
+@cli.command('continuously-upload-results')
+def continuously_upload_results():
+  """Upload the results dir every few seconds"""
+  while True:
+    _upload_results()
+    time.sleep(10)
+
+
+if __name__ == '__main__':
+  cli()

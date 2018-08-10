@@ -1,0 +1,283 @@
+#! bin/python
+# -*- coding: utf-8 -*-
+# Copyright 2018 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from __future__ import unicode_literals
+
+import logging
+import os
+import subprocess
+
+import click
+from colorama import Fore
+
+import berg
+import berg.configuration
+from berg import git_util, metadata_util, gsutil, util
+from berg import logger
+from berg.configuration import config
+from berg.metadata_util import sketchy_guess_at_results_dir_from_cmd
+from berg.util import check_call, check_output
+from berg.util import spinner
+
+
+@click.group()
+@click.option('--verbose', '-v', is_flag=True, default=False)
+def cli(verbose):
+  if verbose:
+    logger.setLevel(logging.DEBUG)
+  logger.debug("Running berg version: %s" % berg.VERSION)
+
+
+@cli.command()
+def init():
+  """Initialize berg"""
+  config.initialize_for_creating_instances(force_walkthrough=True)
+  print(f"{Fore.GREEN}Successfully initialized berg 🙌 . If you'd like to edit "
+        "this configuration, open the json file with your editor of choice.")
+
+
+@cli.command()
+@click.argument('cmd')
+@click.option('--name', '-n', default='berg-experiment', help="Experiment name prefix")
+@click.option('--results-dir', '-r', default=None)
+@click.option('--dry-run', is_flag=True, default=False)
+@click.option('--num-machines', '-m', default=1, type=int)
+@click.option('--mpi_proc_per_machine', default=None, type=int, help="defaults to num_gpus")
+@click.option('--num-gpus', '-g', default=4, type=int)
+@click.option('--num-cpus', '-c', default=None, type=int, help="Default to 8x num_gpus")
+@click.option('--gpu-type', '-t', default='p100', help="{p100, v100, k80}")
+@click.option('--preemptible', '-p', is_flag=True, default=False)
+@click.option('--kill/--no-kill', help="Kill instance after job", default=True)
+@click.option('--install-script', '-i', default='pip install -e . --upgrade')
+def run(cmd, name, dry_run, preemptible, install_script,
+        results_dir, kill, num_machines, mpi_proc_per_machine, num_gpus, gpu_type, num_cpus):
+  """Create a berg job and spin up an instance"""
+  config.initialize_for_creating_instances()
+  job_name = "%s-%s" % (name, util.random_alphanum(6))  # Avoid collisions
+  repo_name = git_util.current_repo_name()
+  results_dir = results_dir or sketchy_guess_at_results_dir_from_cmd(cmd)
+  if not num_cpus:
+    num_cpus = num_gpus * 8
+  if not mpi_proc_per_machine:
+    mpi_proc_per_machine = num_gpus
+
+  # hostfiles for MPI
+  if num_machines == 1:
+    machine_names = [job_name]
+  else:
+    machine_names = []
+    for machine_nr in range(num_machines):
+      machine_names.append(job_name + '-' + '0' * ((num_machines - 1) // 10 - machine_nr // 10) + str(machine_nr))
+
+  # Generate the job metadata that will be synced to the instance
+  metadata = {
+    'cmd': cmd,
+    'results_dir': results_dir,
+    'gcs_results_dir': os.path.join(config.gcs_results_root, results_dir),
+    'install_script': install_script,
+    'instance_name': job_name,
+    'kill_instance_after_job': kill,
+    'repo_name': repo_name,
+    'git_commit': git_util.output('git rev-parse --short HEAD'),
+    'git_patch': git_util.output('git diff HEAD'),  # Record git working state
+    'use_mpi': num_machines > 1,
+    'host_names': machine_names,
+    'mpi_proc_per_machine': mpi_proc_per_machine,
+  }
+  metadata_util.save_to_local_path(metadata, job_name)
+  util.pretty_print_metadata('[%s] job metadata' % job_name, metadata)
+
+  with spinner("Uploading code and job metadata to %s" % config.gcs_berg_root):
+    # Upload code
+    gsutil.upload_repo(repo_name)
+    gsutil.upload_berg_repo_for_self_update()
+
+    # Upload metadata
+    metadata_util.upload_to_gcs(job_name)
+    metadata_util.upload_copy_to_gcs_results_dir(job_name, results_dir)
+
+  # Construct a gcloud instance(s) create command with our information
+  create_instance_script = f"""gcloud beta compute instances create {' '.join(machine_names)}\\
+  --async {'--preemptible' if preemptible else ''} \\
+  --machine-type=custom-{num_cpus}-{6656 * num_cpus} \\
+  --subnet=default \\
+  --maintenance-policy=TERMINATE \\
+  --service-account={config.service_account} \\
+  --scopes=https://www.googleapis.com/auth/cloud-platform \\
+  --accelerator=type=nvidia-tesla-{gpu_type},count={num_gpus} \\
+  --image={config.default_image} \\
+  --image-project={config.default_image_project} \\
+  --boot-disk-size=1000GB \\
+  --boot-disk-type=pd-ssd \\
+  --boot-disk-device-name={job_name} \\
+  --metadata=startup-script='export PATH=/root/anaconda3/bin:$PATH && \\
+                berg-worker init -b {config.bucket} && \\
+                berg-worker run {job_name}'"""
+
+  util.pretty_print_cmd("[%s] gcloud script" % job_name, create_instance_script)
+
+  if dry_run:
+    print(Fore.YELLOW + "Not creating instance because --dry-run was specified")
+  else:
+    with spinner('Running gcloud command to create [%s]...' % job_name):
+      check_call(create_instance_script)
+    print("Executed [%s] creation script 🙌 \n"
+          "Watch the job with `berg list` or `berg tail %s`" % (
+            job_name, job_name))
+
+
+@cli.command('devbox')
+@click.option('--name', '-n', default='devbox')
+@click.option('--num-gpus', '-g', default=4, type=int)
+@click.option('--gpu-type', '-t', default='p100', help="{p100, v100, k80}")
+@click.option('--num-cpus', '-c', default=None, type=int, help="Default to 8x num_gpus")
+@click.option('--num-machines', '-m', default=1, type=int)
+def devbox(name, num_gpus, gpu_type, num_cpus, num_machines):
+  """Create a devbox with 4 GPUs"""
+  cmd = f"""berg run 'echo hello I am a devbox' \\
+    --name={name} \\
+    --no-kill \\
+    --num-gpus={num_gpus} \\
+    --num-machines={num_machines} \\
+    --gpu-type={gpu_type} \\
+    --results-dir=devboxes/"""
+  if num_cpus:
+    cmd += f" --num-cpus={num_cpus}"
+  print(f"Creating a devbox with the following berg command")
+  util.pretty_print_cmd(f"[{name}] berg creation script", cmd)
+  subprocess.run(cmd, shell=True)
+
+
+@cli.command()
+@click.option('--include-cmd', '-c', is_flag=True, default=False)
+@click.option('--all/--strict', '-a/-A', default=True)
+def list(include_cmd, all):
+  """List jobs along with results_dir"""
+  with spinner('Fetching instances from gcloud...'):
+    command = "gcloud compute instances list --format 'csv(name,status)'"
+    output = check_output(command)
+  header = ["NAME", "STATUS", "RESULTS_DIR"]
+  if include_cmd:
+    header += ['CMD']
+  table = util.pretty_table(header)
+
+  rows = []
+  for line in output.split('\n')[1:]:
+    name, status = line.split(',')
+    metadata = metadata_util.parse_local(name, permissive=True)
+    if not metadata and not all:
+      continue
+
+    results_dir = metadata.get('results_dir', '<none>')
+    row = [name, status, results_dir]
+    if include_cmd:
+      row += [metadata['cmd']]
+    rows.append(row)
+
+  rows = sorted(rows, key=lambda x: x[2])  # Sort by results_dir
+  [table.add_row(row) for row in rows]
+  print(table.draw())
+
+
+@cli.command()
+@click.argument('name')
+@click.option('--bind-address', '-L', multiple=True)
+def ssh(name, bind_address):
+  """ssh into an instance as root"""
+  cmd = "gcloud compute ssh root@%s --" % name
+  cmd += ''.join([" -L %s" % addr for addr in bind_address])
+  check_call(cmd, permissive=True)
+
+
+@cli.command()
+@click.argument('name')
+def ip(name):
+  """Return the public ip address of an instance"""
+  print(_name_to_ip(name))
+
+
+def _name_to_ip(name):
+  command = "gcloud compute instances list --filter='name=%s' " \
+            "--format 'csv(EXTERNAL_IP)'" % name
+  return check_output(command).split('\n')[1]
+
+
+def get_names(name):
+  command = "gcloud compute instances list --filter='" + name + "' --format 'csv(name)'"
+  output = check_output(command)
+  names = output.split('\n')[1:]
+  return names
+
+
+@cli.command()
+@click.argument('name')
+def sync(name):
+  """Watch and sync the current repo to a running instance"""
+  remote_dir = '/root/code'
+
+  names = get_names(name)
+
+  # Build the sync_commands outside of the function to cache the ip and repo_path
+  sync_commands = []
+  for machine_name in names:
+    sync_commands.append("""rsync -azP --no-links \
+          -e "ssh -q -i {ssh_key_path} -o StrictHostKeyChecking=no" \
+          --filter=':- .gitignore' \
+          {current_repo_path} root@{ip}:{remote_dir}
+          """.format(
+      ip=_name_to_ip(machine_name),
+      ssh_key_path=os.path.expanduser('~/.ssh/google_compute_engine'),
+      remote_dir=remote_dir,
+      current_repo_path=git_util.current_repo_path(),
+    ))
+  remote_path = os.path.join(remote_dir, git_util.current_repo_name())
+
+  def _sync_once():
+    print("Noticed local changes, starting sync...")
+    for cmd in sync_commands:
+      check_call(cmd)
+    print(Fore.CYAN + "Synced local changes to [%s] %s\n" % (name, remote_path))
+
+  _sync_once()
+  util.watch_dir_and_run_fn(git_util.current_repo_path(), _sync_once)
+
+
+@cli.command()
+@click.argument('name')
+def kill(name):
+  """Kill an instance"""
+  names = get_names(name)
+  with spinner('Deleting instance(s) [%s]' % (name)):
+    check_call("gcloud -q compute instances delete  %s" % ' '.join(names), permissive=True)
+
+
+@cli.command()
+@click.argument('name')
+def tail(name):
+  """Tail logs from an instance"""
+  check_call('gcloud compute instances tail-serial-port-output %s' % name,
+             permissive=True)
+
+
+@cli.command()
+@click.argument('name')
+def log(name):
+  """Return all logs from an instance"""
+  check_call('gcloud compute instances get-serial-port-output %s' % name,
+             permissive=True)
+
+
+if __name__ == '__main__':
+  cli()
