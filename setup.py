@@ -47,6 +47,5 @@ setup(
     'bin/berg',
     'bin/berg-worker',
     'bin/berg-results',
-    'bin/berg-self-update',
   ]
 )
