@@ -60,7 +60,7 @@ class Config():
 
   @property
   def gcs_berg_root(self):
-    return os.path.join(self.bucket, '.berg/')
+    return 'gs://' + os.path.join(self.bucket, '.berg/')
 
   @property
   def gcs_repo_root(self):
@@ -68,7 +68,7 @@ class Config():
 
   @property
   def gcs_results_root(self):
-    return os.path.join(self.bucket, 'berg_results')
+    return 'gs://' + os.path.join(self.bucket, 'berg_results')
 
   def initialize_with_bucket(self, bucket):
     stored_config = {
