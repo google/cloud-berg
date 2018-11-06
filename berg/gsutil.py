@@ -27,6 +27,7 @@ def cp(src_path, dest_path):
 
 
 def rsync(src_dir, dest_dir):
+  dest_dir = 'gs://' + dest_dir
   if logger.level < logging.DEBUG:
     check_call('gsutil -q -m rsync -r %s %s' % (src_dir, dest_dir))
   else:
