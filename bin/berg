@@ -92,7 +92,7 @@ def run(cmd, name, dry_run, preemptible, install_script,
     'repo_name': repo_name,
     'git_commit': git_util.output('git rev-parse --short HEAD'),
     'git_patch': git_util.output('git diff HEAD'),  # Record git working state
-    'use_mpi': num_machines > 1,
+    'use_mpi': True,
     'host_names': machine_names,
     'mpi_proc_per_machine': mpi_proc_per_machine,
   }
